@@ -14,6 +14,8 @@
 #include <cuda.h>
 #include <string.h>
 #include "common/pgm.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -108,6 +110,77 @@ __global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float
 
 }
 
+__device__ void drawLine(int x1, int y1, int x2, int y2, unsigned char *image, int w, int h)
+{
+    int dx = abs(x2 - x1);
+    int dy = abs(y2 - y1);
+    int sx = (x1 < x2) ? 1 : -1;
+    int sy = (y1 < y2) ? 1 : -1;
+    int err = dx - dy;
+
+    while (true)
+    {
+        // Marcar el píxel si está dentro de los límites
+        if (x1 >= 0 && x1 < w && y1 >= 0 && y1 < h)
+        {
+            image[y1 * w + x1] = 255; // Valor blanco para las líneas
+        }
+
+        if (x1 == x2 && y1 == y2)
+            break;
+
+        int e2 = 2 * err;
+        if (e2 > -dy)
+        {
+            err -= dy;
+            x1 += sx;
+        }
+        if (e2 < dx)
+        {
+            err += dx;
+            y1 += sy;
+        }
+    }
+}
+
+__global__ void drawDetectedLines(int *acc, int rBins, int degreeBins, int w, int h, float rMax, float rScale, float *d_Cos, float *d_Sin, unsigned char *image, int threshold, float radInc)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rBins * degreeBins) return;
+
+    int rIdx = idx / degreeBins;
+    int tIdx = idx % degreeBins;
+
+    // Verificar si el peso supera el threshold
+    int weight = acc[rIdx * degreeBins + tIdx];
+    if (weight > threshold)
+    {
+        // Calcular r y θ usando radInc
+        float r = rIdx * rScale - rMax;
+        float theta = tIdx * radInc;
+
+        // Convertir a coordenadas de línea
+        float a = cos(theta);
+        float b = sin(theta);
+        float x0 = a * r;
+        float y0 = b * r;
+        int x1 = round(x0 + 1000 * (-b));
+        int y1 = round(y0 + 1000 * (a));
+        int x2 = round(x0 - 1000 * (-b));
+        int y2 = round(y0 - 1000 * (a));
+
+        // Ajustar al sistema centrado
+        x1 += w / 2;
+        x2 += w / 2;
+        y1 = h / 2 - y1;
+        y2 = h / 2 - y2;
+
+        // Dibujar la línea en el buffer de imagen
+        drawLine(x1, y1, x2, y2, image, w, h);
+    }
+}
+
+
 //*****************************************************************
 int main (int argc, char **argv)
 {
@@ -160,18 +233,83 @@ int main (int argc, char **argv)
 
   // execution configuration uses a 1-D grid of 1-D blocks, each made of 256 threads
   //1 thread por pixel
-  int blockNum = max(1, (int)ceil((float)(w * h) / 256));
-  printf("blockNum: %d, w: %d, h: %d\n", blockNum, w, h);
-  GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+  int kernelBlockNum  = max(1, (int)ceil((float)(w * h) / 256));
+  printf("blockNum: %d, w: %d, h: %d\n", kernelBlockNum , w, h);
+
+  // CUDA Events para medir el tiempo
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  // Registrar inicio del evento
+  cudaEventRecord(start, 0);
+  //lanzar el kernel
+  GPU_HoughTran <<< kernelBlockNum , 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+  //Registra fin del evento
+  cudaEventRecord(stop, 0);
+
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess)
   {
       printf("CUDA error: %s\n", cudaGetErrorString(err));
       return -1;
   }
-  cudaDeviceSynchronize();
+
+  cudaEventSynchronize(stop);
+  float elapsedTime;
+  cudaEventElapsedTime(&elapsedTime, start, stop);
+  printf("Tiempo de ejecución del kernel: %.2f ms\n", elapsedTime);
+
+  // Destruir eventos CUDA
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
   // get results from device
   cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
+
+
+  // Calcular threshold basado en el promedio y desviación estándar
+  int sum = 0, count = 0;
+  for (i = 0; i < rBins * degreeBins; i++)
+  {
+      sum += h_hough[i];
+      if (h_hough[i] > 0)
+          count++;
+  }
+  float mean = sum / (float)count;
+  float stddev = 0;
+  for (i = 0; i < rBins * degreeBins; i++)
+  {
+      if (h_hough[i] > 0)
+          stddev += pow(h_hough[i] - mean, 2);
+  }
+  stddev = sqrt(stddev / count);
+  int threshold = mean + 2 * stddev;
+
+  printf("Threshold calculado: %d\n", threshold);
+
+  // Crear buffer para la imagen en la GPU
+  unsigned char *d_image, *h_image;
+  h_image = (unsigned char *)calloc(w * h, sizeof(unsigned char)); // Inicializa en negro
+  cudaMalloc((void **)&d_image, sizeof(unsigned char) * w * h);
+  cudaMemset(d_image, 0, sizeof(unsigned char) * w * h); // Inicializar en negro
+
+  // Lanzar kernel para dibujar las líneas
+  int totalThreads = rBins * degreeBins;
+  int drawBlockNum = (totalThreads + 255) / 256;
+  drawDetectedLines<<<drawBlockNum, 256>>>(d_hough, rBins, degreeBins, w, h, rMax, rScale, d_Cos, d_Sin, d_image, threshold, radInc);
+  cudaDeviceSynchronize();
+
+  // Copiar la imagen resultante de la GPU al host
+  cudaMemcpy(h_image, d_image, sizeof(unsigned char) * w * h, cudaMemcpyDeviceToHost);
+
+  // Guardar la imagen como archivo PNG
+  stbi_write_png("output.png", w, h, 1, h_image, w);
+  printf("Imagen con líneas detectadas guardada como output.png\n");
+
+  // Liberar memoria de la imagen
+  cudaFree(d_image);
+  free(h_image);
+
 
   // compare CPU and GPU results
   for (i = 0; i < degreeBins * rBins; i++)
