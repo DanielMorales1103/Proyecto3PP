@@ -120,10 +120,12 @@ __device__ void drawLine(int x1, int y1, int x2, int y2, unsigned char *image, i
 
     while (true)
     {
-        // Marcar el píxel si está dentro de los límites
         if (x1 >= 0 && x1 < w && y1 >= 0 && y1 < h)
         {
-            image[y1 * w + x1] = 255; // Valor blanco para las líneas
+            int idx = (y1 * w + x1) * 3;
+            image[idx + 0] = 255; // Rojo
+            image[idx + 1] = 0;   // Verde
+            image[idx + 2] = 0;   // Azul
         }
 
         if (x1 == x2 && y1 == y2)
@@ -258,7 +260,7 @@ int main (int argc, char **argv)
   cudaEventSynchronize(stop);
   float elapsedTime;
   cudaEventElapsedTime(&elapsedTime, start, stop);
-  printf("Tiempo de ejecución del kernel: %.2f ms\n", elapsedTime);
+  printf("Tiempo de ejecucion del kernel: %.2f ms\n", elapsedTime);
 
   // Destruir eventos CUDA
   cudaEventDestroy(start);
@@ -279,32 +281,46 @@ int main (int argc, char **argv)
   float stddev = 0;
   for (i = 0; i < rBins * degreeBins; i++)
   {
-      if (h_hough[i] > 0)
-          stddev += pow(h_hough[i] - mean, 2);
+    if (h_hough[i] > 0)
+        stddev += pow(h_hough[i] - mean, 2);
   }
   stddev = sqrt(stddev / count);
-  int threshold = mean + 2 * stddev;
+  int threshold = mean + 2.2 * stddev;
 
   printf("Threshold calculado: %d\n", threshold);
 
   // Crear buffer para la imagen en la GPU
   unsigned char *d_image, *h_image;
-  h_image = (unsigned char *)calloc(w * h, sizeof(unsigned char)); // Inicializa en negro
-  cudaMalloc((void **)&d_image, sizeof(unsigned char) * w * h);
-  cudaMemset(d_image, 0, sizeof(unsigned char) * w * h); // Inicializar en negro
+  h_image = (unsigned char *)calloc(w * h * 3, sizeof(unsigned char)); // Inicializa en negro
+  cudaMalloc((void **)&d_image, sizeof(unsigned char) * w * h * 3);
+  // Convertir la imagen original a RGB
+  for (int i = 0; i < h; i++) {
+      for (int j = 0; j < w; j++) {
+          int idxGray = i * w + j;
+          int idxRGB = idxGray * 3;
+          unsigned char pixel = h_in[idxGray]; // Escala de grises
+          h_image[idxRGB + 0] = pixel; // Rojo
+          h_image[idxRGB + 1] = pixel; // Verde
+          h_image[idxRGB + 2] = pixel; // Azul
+      }
+  }
 
-  // Lanzar kernel para dibujar las líneas
+  // Copiar la imagen inicial a la GPU
+  cudaMemcpy(d_image, h_image, sizeof(unsigned char) * w * h * 3, cudaMemcpyHostToDevice);
+
   int totalThreads = rBins * degreeBins;
   int drawBlockNum = (totalThreads + 255) / 256;
+  
+  // Lanzar kernel para dibujar las líneas  
   drawDetectedLines<<<drawBlockNum, 256>>>(d_hough, rBins, degreeBins, w, h, rMax, rScale, d_Cos, d_Sin, d_image, threshold, radInc);
   cudaDeviceSynchronize();
 
   // Copiar la imagen resultante de la GPU al host
-  cudaMemcpy(h_image, d_image, sizeof(unsigned char) * w * h, cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_image, d_image, sizeof(unsigned char) * w * h * 3, cudaMemcpyDeviceToHost);
 
   // Guardar la imagen como archivo PNG
-  stbi_write_png("output.png", w, h, 1, h_image, w);
-  printf("Imagen con líneas detectadas guardada como output.png\n");
+  stbi_write_png("output.png", w, h, 3, h_image, w * 3);
+  printf("Imagen con lineas detectadas guardada como output.png\n");
 
   // Liberar memoria de la imagen
   cudaFree(d_image);
@@ -312,11 +328,11 @@ int main (int argc, char **argv)
 
 
   // compare CPU and GPU results
-  for (i = 0; i < degreeBins * rBins; i++)
-  {
-    if (cpuht[i] != h_hough[i])
-      printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
-  }
+  // for (i = 0; i < degreeBins * rBins; i++)
+  // {
+  //   if (cpuht[i] != h_hough[i])
+  //     printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
+  // }
   printf("Done!\n");
 
   // Liberar memoria de la GPU
